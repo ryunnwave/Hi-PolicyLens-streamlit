@@ -1,24 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-RegWatch – Streamlit (No external AI key)
-강화 내용
-- RSS: requests로 직접 GET(User-Agent 지정) → feedparser.parse(bytes)
-- HTML: 직접 GET + BeautifulSoup
-- 폴백1: RSS가 막히면 같은 사이트의 뉴스/보도자료 HTML 목록에서 스크랩
-- 폴백2: 위도 막히면 공개 텍스트 리더(r.jina.ai)로 차단 우회(키 불필요, 단순 프록시)
-- 디버그 로그/캐시 초기화 버튼
+RegWatch – Streamlit (no external API key)
+- 버그 수정: 문장분할 정규식 PatternError 제거
+- 폴백 강화: RSS/HTML 차단 시 r.jina.ai 텍스트 프록시 + 텍스트에서 URL 추출
+- 대상: ECHA, CBP(press+trade), MOTIE, BMUV
 """
 
 import re, io, json, hashlib
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict
+from urllib.parse import urlparse, unquote
 
 import requests, feedparser, pandas as pd
 from bs4 import BeautifulSoup
 from dateutil import parser as dtparse
 import streamlit as st
 
-# ----------------------- UI / 스타일 -----------------------
+# ----------------------- UI -----------------------
 st.set_page_config(page_title="RegWatch – 글로벌 규제 모니터링", layout="wide")
 BRAND = "#0f2e69"; ACCENT = "#dc8d32"
 st.markdown(f"""
@@ -47,7 +45,7 @@ small.mono {{ font-family: ui-monospace, Menlo, Consolas, "Courier New", monospa
 """, unsafe_allow_html=True)
 
 # ----------------------- 설정 -----------------------
-USER_AGENT = "Mozilla/5.0 (compatible; RegWatch/1.0; +https://streamlit.io)"
+USER_AGENT = "Mozilla/5.0 (compatible; RegWatch/1.1; +https://streamlit.io)"
 HEADERS = {"User-Agent": USER_AGENT, "Accept-Language": "ko,en;q=0.8"}
 TIMEOUT = 25
 MAX_PER_SOURCE = 60
@@ -60,11 +58,12 @@ SOURCES = [
     {"id": "bmuv",  "name": "BMUV (독일 환경부)", "type": "rss", "url": "https://www.bundesumweltministerium.de/meldungen.rss"},
 ]
 
+# ----------------------- 로그 -----------------------
 if "logs" not in st.session_state: st.session_state.logs=[]
 def log(msg): st.session_state.logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 def clear_logs(): st.session_state.logs=[]
 
-# ----------------------- 공통 유틸 -----------------------
+# ----------------------- 유틸 -----------------------
 def md5_hex(s:str)->str: return hashlib.md5(s.encode("utf-8")).hexdigest()
 
 def to_iso(s:str)->str:
@@ -77,14 +76,25 @@ def to_iso(s:str)->str:
 
 def clean_text(s:str)->str: return re.sub(r"\s+"," ", (s or "")).strip()
 
-def split_sents(t:str): 
-    return [p for p in re.split(r'(?<=[\.!\?]|다\.|요\.)\s+', clean_text(t)) if p]
+def split_sentences(text: str):
+    """고정폭 lookbehind 조합으로 PatternError 방지"""
+    t = clean_text(text)
+    pattern = r'(?:(?<=\.)|(?<=!)|(?<=\?)|(?<=다\.)|(?<=요\.))\s+'
+    try:
+        parts = re.split(pattern, t)
+    except re.error:
+        parts = re.split(r'[.!?]\s+', t)
+    return [p for p in parts if p]
 
-def simple_summary(text:str, max_sentences=2, max_len=320)->str:
-    s=split_sents(text);  out=" ".join(s[:max_sentences]) if s else clean_text(text)
-    return out[:max_len]
+def simple_summary(text: str, max_sentences=2, max_len=320) -> str:
+    try:
+        sents = split_sentences(text)
+        out = " ".join(sents[:max_sentences]) if sents else clean_text(text)
+        return out[:max_len]
+    except Exception:
+        return clean_text(text)[:max_len]
 
-def extract_keywords(text:str, topn=5):
+def extract_keywords(text: str, topn=5):
     stop=set(["the","and","for","with","from","that","this","are","was","were","will","have","has","been","on","of","in","to","a","an","by","및","과","에","의","으로"])
     words=re.sub(r"[^a-z0-9가-힣 ]"," ", (text or "").lower()).split()
     freq={}
@@ -120,7 +130,15 @@ def normalize(source_id, source_name, title, url, date_iso, summary)->Dict:
         "country": country_of(source_id)
     }
 
-# ----------------------- HTTP (직접 + 프록시 폴백) -----------------------
+def title_from_url(url: str) -> str:
+    p = urlparse(url)
+    segs = [unquote(s) for s in p.path.split("/") if s]
+    if not segs: return p.netloc
+    segs = segs[-3:]
+    t = " / ".join(s.replace("-", " ").strip() for s in segs)
+    return t.title()
+
+# ----------------------- HTTP + 폴백 -----------------------
 @st.cache_data(ttl=1500, show_spinner=False)
 def http_get(url:str)->str:
     r=requests.get(url, headers=HEADERS, timeout=TIMEOUT)
@@ -133,14 +151,14 @@ def http_get_bytes(url:str)->bytes:
     return r.content
 
 def fetch_with_fallback(url:str)->str:
-    """직접 GET이 실패하면 r.jina.ai 프록시(키 불필요)로 동일 페이지 텍스트 시도"""
     try:
         return http_get(url)
     except Exception as ex:
         log(f"직접요청 실패 → 프록시 시도: {url} ({type(ex).__name__})")
+        base = re.sub(r"^https?://","", url)
         for prefix in ("https://r.jina.ai/http://", "https://r.jina.ai/https://"):
             try:
-                txt=http_get(prefix + re.sub(r"^https?://","", url))
+                txt=http_get(prefix + base)
                 if txt and len(txt)>100: return txt
             except Exception as ex2:
                 log(f"프록시 실패: {prefix}... ({type(ex2).__name__})")
@@ -154,7 +172,20 @@ def fetch_bytes_with_fallback(url:str)->bytes:
         txt = fetch_with_fallback(url)
         return txt.encode("utf-8", errors="ignore")
 
-# ----------------------- 수집기 (RSS/HTML) -----------------------
+def extract_links_from_text(text: str, domain: str, include: List[str]=None, limit=80) -> List[str]:
+    """프록시 텍스트에서 해당 도메인의 URL만 추출"""
+    pat = rf'https?://(?:www\.)?{re.escape(domain)}/[^\s\)\"\']+'
+    urls = re.findall(pat, text)
+    if include:
+        urls = [u for u in urls if any(k in u for k in include)]
+    seen = {}
+    for u in urls:
+        if u not in seen:
+            seen[u] = True
+            if len(seen) >= limit: break
+    return list(seen.keys())
+
+# ----------------------- 수집기 -----------------------
 def fetch_rss_one(source_id, name, feed_url)->List[Dict]:
     out=[]
     try:
@@ -212,22 +243,18 @@ def fetch_echa_legislation()->List[Dict]:
     except Exception as ex:
         log(f"ECHA FAIL {type(ex).__name__}: {ex}")
 
+    # 텍스트 프록시에서 URL만 추출(마지막 폴백)
     if len(items)<5:
         try:
-            html=fetch_with_fallback("https://echa.europa.eu/news")
-            soup=BeautifulSoup(html, "html.parser")
+            txt = fetch_with_fallback("https://echa.europa.eu/legislation")
+            links = extract_links_from_text(txt, "echa.europa.eu", include=["legislation","news"], limit=50)
             add=0
-            for a in soup.select('a[href*="/news"]'):
-                href=a.get("href","")
-                if not href: continue
-                href = href if href.startswith("http") else f"https://echa.europa.eu{href}"
-                title=a.get_text(strip=True)
-                if not title: continue
-                items.append(normalize("echa","ECHA (EU – European Chemicals Agency)", title, href, "", simple_summary(title))); add+=1
-                if len(items)>=MAX_PER_SOURCE: break
-            log(f"ECHA 뉴스 폴백 {add}건")
+            for u in links:
+                items.append(normalize("echa","ECHA (EU – European Chemicals Agency)", title_from_url(u), u, "", simple_summary(title_from_url(u))))
+                add+=1
+            log(f"ECHA 텍스트링크 폴백 {add}건")
         except Exception as ex:
-            log(f"ECHA NEWS FAIL {type(ex).__name__}: {ex}")
+            log(f"ECHA TXT FAIL {type(ex).__name__}: {ex}")
 
     uniq={}; [uniq.setdefault(it["url"], it) for it in items]
     return list(uniq.values())[:MAX_PER_SOURCE]
@@ -263,11 +290,22 @@ def fetch_motie_generic()->List[Dict]:
     except Exception as ex:
         log(f"MOTIE FAIL {type(ex).__name__}: {ex}")
 
+    if len(items)<5:
+        # 텍스트에서 링크 추출 폴백
+        try:
+            txt = fetch_with_fallback("https://www.motie.go.kr/")
+            links = extract_links_from_text(txt, "www.motie.go.kr", include=["bbs","board","news","press","notice"], limit=50)
+            add=0
+            for u in links:
+                items.append(normalize("motie","MOTIE (대한민국 산업통상자원부)", title_from_url(u), u, "", simple_summary(title_from_url(u)))); add+=1
+            log(f"MOTIE 텍스트링크 폴백 {add}건")
+        except Exception as ex:
+            log(f"MOTIE TXT FAIL {type(ex).__name__}: {ex}")
+
     uniq={}; [uniq.setdefault(it["url"], it) for it in items]
     return list(uniq.values())[:MAX_PER_SOURCE]
 
 def fetch_cbp_html_fallback()->List[Dict]:
-    """CBP RSS가 막히면 HTML 목록에서 가져오기"""
     items=[]
     pages=[
         ("https://www.cbp.gov/newsroom", "U.S. Customs and Border Protection (CBP)"),
@@ -287,12 +325,23 @@ def fetch_cbp_html_fallback()->List[Dict]:
                 if len(items)>=MAX_PER_SOURCE: break
         except Exception as ex:
             log(f"CBP HTML FAIL {type(ex).__name__}: {ex}")
-    log(f"CBP HTML 폴백 {added}건")
+
+    if len(items)<5:
+        # 텍스트 링크 추출 폴백
+        try:
+            for url,_ in pages:
+                txt = fetch_with_fallback(url)
+                links = extract_links_from_text(txt, "www.cbp.gov", include=["newsroom"], limit=80)
+                for u in links:
+                    items.append(normalize("cbp","U.S. Customs and Border Protection (CBP)", title_from_url(u), u, "", simple_summary(title_from_url(u))))
+            log(f"CBP 텍스트링크 폴백 {len(items)}건")
+        except Exception as ex:
+            log(f"CBP TXT FAIL {type(ex).__name__}: {ex}")
+
     uniq={}; [uniq.setdefault(it["url"], it) for it in items]
     return list(uniq.values())[:MAX_PER_SOURCE]
 
 def fetch_bmuv_html_fallback()->List[Dict]:
-    """BMUV RSS가 막히면 HTML 목록에서 가져오기"""
     items=[]
     try:
         html=fetch_with_fallback("https://www.bundesumweltministerium.de/meldungen")
@@ -308,6 +357,17 @@ def fetch_bmuv_html_fallback()->List[Dict]:
         log(f"BMUV HTML 폴백 {add}건")
     except Exception as ex:
         log(f"BMUV HTML FAIL {type(ex).__name__}: {ex}")
+
+    if len(items)<5:
+        try:
+            txt = fetch_with_fallback("https://www.bundesumweltministerium.de/meldungen")
+            links = extract_links_from_text(txt, "www.bundesumweltministerium.de", include=["meldungen"], limit=80)
+            for u in links:
+                items.append(normalize("bmuv","BMUV (독일 환경부)", title_from_url(u), u, "", simple_summary(title_from_url(u))))
+            log(f"BMUV 텍스트링크 폴백 {len(items)}건")
+        except Exception as ex:
+            log(f"BMUV TXT FAIL {type(ex).__name__}: {ex}")
+
     uniq={}; [uniq.setdefault(it["url"], it) for it in items]
     return list(uniq.values())[:MAX_PER_SOURCE]
 
