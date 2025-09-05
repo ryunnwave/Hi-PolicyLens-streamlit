@@ -2,14 +2,15 @@
 """
 RegWatch (Streamlit / No external AI API)
 - 대상 사이트:
-  • ECHA legislation: https://echa.europa.eu/legislation
-  • CBP: https://www.cbp.gov/  (공식 RSS 사용)
+  • ECHA: https://echa.europa.eu/legislation  (+ news 폴백)
+  • CBP: https://www.cbp.gov/  (RSS 2종 - trade, press)
   • MOTIE: https://www.motie.go.kr/
-  • BMUV: https://www.bundesumweltministerium.de/  (공식 RSS 사용)
-- 기능: 수집 → 간이요약(로컬) → 표/카드/보고서 + CSV/MD 다운로드
+  • BMUV: https://www.bundesumweltministerium.de/ (RSS)
+- 핵심 수정: RSS를 requests로 받아서 feedparser.parse(bytes) 처리 (User-Agent 지정)
+- 디버그 로그/캐시초기화 버튼 추가
 """
 
-import re, os, io, hashlib
+import re, os, io, hashlib, json
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict
 
@@ -44,20 +45,20 @@ html, body, [class*="css"] {{ font-family: 'Pretendard', -apple-system, BlinkMac
 .keyword {{ display:inline-block; border:1px solid #e2e8f0; font-size:11px; padding:2px 8px; border-radius:8px; margin-right:6px; margin-top:6px; }}
 .meta {{ color:#64748b; font-size:12px; margin-top:6px; }}
 hr.sep {{ border:none; border-top:1px solid #e2e8f0; margin:16px 0; }}
+small.mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }}
 </style>
 """, unsafe_allow_html=True)
 
 # ---------------------------
 # 상수/설정
 # ---------------------------
-USER_AGENT = "Mozilla/5.0 (compatible; RegWatch/1.0)"
+USER_AGENT = "Mozilla/5.0 (compatible; RegWatch/1.0; +https://streamlit.io)"
 HEADERS = {"User-Agent": USER_AGENT, "Accept-Language": "ko,en;q=0.8"}
-TIMEOUT = 15
+TIMEOUT = 20
 MAX_PER_SOURCE = 60
 
 SOURCES = [
     {"id": "echa",  "name": "ECHA (EU – European Chemicals Agency)", "type": "html", "url": "https://echa.europa.eu/legislation"},
-    # CBP는 도메인 내 공식 RSS 두 개를 사용(press, trade). 루트 도메인 요구 충족(동일 사이트).
     {"id": "cbp",   "name": "U.S. Customs and Border Protection (CBP)", "type": "rss-multi",
      "urls": ["https://www.cbp.gov/rss/trade", "https://www.cbp.gov/rss/press-releases"]},
     {"id": "motie", "name": "MOTIE (대한민국 산업통상자원부)", "type": "html", "url": "https://www.motie.go.kr/"},
@@ -65,9 +66,23 @@ SOURCES = [
 ]
 
 # ---------------------------
+# 로그 유틸
+# ---------------------------
+if "logs" not in st.session_state:
+    st.session_state.logs = []
+
+def log(msg):
+    ts = datetime.now().strftime("%H:%M:%S")
+    st.session_state.logs.append(f"[{ts}] {msg}")
+
+def clear_logs():
+    st.session_state.logs = []
+
+# ---------------------------
 # 헬퍼들
 # ---------------------------
 def md5_hex(s: str) -> str:
+    import hashlib
     return hashlib.md5(s.encode("utf-8")).hexdigest()
 
 def to_iso(s: str) -> str:
@@ -92,11 +107,9 @@ def days_new(iso: str, days=7) -> bool:
 def clean_text(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
 
-def split_sentences(text: str) -> List[str]:
+def split_sentences(text: str):
     t = clean_text(text)
-    # '.', '!', '?', '다.', '요.' 등 기준으로 단순 분할
-    parts = re.split(r'(?<=[\.!\?]|다\.|요\.)\s+', t)
-    return [p for p in parts if p]
+    return [p for p in re.split(r'(?<=[\.!\?]|다\.|요\.)\s+', t) if p]
 
 def simple_summary(text: str, max_sentences=2, max_len=320) -> str:
     sents = split_sentences(text)
@@ -105,7 +118,7 @@ def simple_summary(text: str, max_sentences=2, max_len=320) -> str:
     out = " ".join(sents[:max_sentences])
     return out[:max_len]
 
-def extract_keywords(text: str, topn=5) -> List[str]:
+def extract_keywords(text: str, topn=5):
     stop = set(["the","and","for","with","from","that","this","are","was","were","will","have","has","been","on","of","in","to","a","an","by","및","과","에","의","으로"])
     words = re.sub(r"[^a-z0-9가-힣 ]"," ", (text or "").lower()).split()
     freq={}
@@ -150,65 +163,62 @@ def normalize(source_id, source_name, title, url, date_iso, summary) -> Dict:
         "country": country_of(source_id),
     }
 
+# ---------------------------
+# HTTP
+# ---------------------------
 @st.cache_data(ttl=1800, show_spinner=False)
 def http_get(url: str) -> str:
     r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
     r.raise_for_status()
     return r.text
 
-def meta_summary_from_page(url: str) -> str:
-    """상세 페이지에서 <meta>나 첫 문단을 읽어 간이요약 생성(없으면 빈 문자열)."""
-    try:
-        html = http_get(url)
-        soup = BeautifulSoup(html, "html.parser")
-        m1 = soup.find("meta", attrs={"name":"description"})
-        if m1 and m1.get("content"): return simple_summary(m1["content"])
-        og = soup.find("meta", property="og:description")
-        if og and og.get("content"): return simple_summary(og["content"])
-        p = soup.find("p")
-        if p: return simple_summary(p.get_text(" ", strip=True))
-    except Exception:
-        pass
-    return ""
+def http_get_bytes(url: str) -> bytes:
+    r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.content
 
 # ---------------------------
-# 수집기 (RSS/HTML)
+# 수집기
 # ---------------------------
 def fetch_rss_one(source_id, name, feed_url) -> List[Dict]:
+    """RSS를 requests로 받아 feedparser.parse(bytes)로 파싱(헤더 보장)"""
     out=[]
-    d = feedparser.parse(feed_url)
-    for e in d.entries[:MAX_PER_SOURCE]:
-        title = getattr(e,"title",""); link = getattr(e,"link","")
-        pub   = getattr(e,"published","") or getattr(e,"updated","") or ""
-        desc  = getattr(e,"summary","") or getattr(e,"description","") or ""
-        summary = simple_summary(f"{title}. {desc}")
-        it = normalize(source_id, name, title, link, pub, summary)
-        if it: out.append(it)
+    try:
+        raw = http_get_bytes(feed_url)
+        d = feedparser.parse(raw)
+        n = 0
+        for e in d.entries[:MAX_PER_SOURCE]:
+            title = getattr(e,"title",""); link = getattr(e,"link","")
+            pub   = getattr(e,"published","") or getattr(e,"updated","") or ""
+            desc  = getattr(e,"summary","") or getattr(e,"description","") or ""
+            summary = simple_summary(f"{title}. {desc}")
+            it = normalize(source_id, name, title, link, pub, summary)
+            if it: out.append(it); n += 1
+        log(f"RSS OK [{name}] {n}건")
+    except Exception as ex:
+        log(f"RSS FAIL [{name}] {type(ex).__name__}: {ex}")
     return out
 
 def fetch_rss_multi(source_id, name, feed_urls: List[str]) -> List[Dict]:
     out=[]
     for u in feed_urls:
-        try:
-            out += fetch_rss_one(source_id, name, u)
-        except Exception:
-            continue
+        out += fetch_rss_one(source_id, name, u)
     # dedup by url
     uniq={}
     for it in out: uniq[it["url"]] = it
     return list(uniq.values())[:MAX_PER_SOURCE]
 
 def fetch_echa_legislation() -> List[Dict]:
-    """ECHA legislation 페이지에서 JSON-LD/링크 추출 → 부족하면 /news 폴백"""
     items=[]
     try:
         html = http_get("https://echa.europa.eu/legislation")
         soup = BeautifulSoup(html, "html.parser")
 
-        # 1) JSON-LD
+        # JSON-LD
+        count = 0
         for s in soup.find_all("script", {"type":"application/ld+json"}):
             try:
-                j = __import__("json").loads(s.string or "")
+                j = json.loads(s.string or "")
                 arr = j if isinstance(j, list) else [j]
                 for n in arr:
                     title = (n.get("headline") or n.get("name") or "").strip()
@@ -217,26 +227,32 @@ def fetch_echa_legislation() -> List[Dict]:
                     date  = n.get("datePublished") or n.get("dateModified") or ""
                     desc  = n.get("description") or ""
                     items.append(normalize("echa","ECHA (EU – European Chemicals Agency)", title, url, date, simple_summary(desc or title)))
+                    count += 1
             except Exception:
                 continue
+        log(f"ECHA JSON-LD 추출 {count}건")
 
-        # 2) 링크 보조(/legislation|/news)
+        # 링크 보조
         if len(items) < 10:
+            added = 0
             for a in soup.find_all("a", href=True):
                 href = a["href"]; text = a.get_text(strip=True)
                 if not href or not text: continue
                 if not re.search(r"/(legislation|news)", href): continue
                 href = href if href.startswith("http") else f"https://echa.europa.eu{href}"
                 items.append(normalize("echa","ECHA (EU – European Chemicals Agency)", text, href, "", simple_summary(text)))
+                added += 1
                 if len(items) >= MAX_PER_SOURCE: break
-    except Exception:
-        pass
+            log(f"ECHA 링크 보조 {added}건")
+    except Exception as ex:
+        log(f"ECHA FAIL: {type(ex).__name__}: {ex}")
 
-    # 폴백: /news
+    # news 폴백
     if len(items) < 5:
         try:
             html = http_get("https://echa.europa.eu/news")
             soup = BeautifulSoup(html, "html.parser")
+            added = 0
             for a in soup.select('a[href*="/news"]'):
                 href = a.get("href","")
                 if not href: continue
@@ -244,22 +260,24 @@ def fetch_echa_legislation() -> List[Dict]:
                 title = a.get_text(strip=True)
                 if not title: continue
                 items.append(normalize("echa","ECHA (EU – European Chemicals Agency)", title, href, "", simple_summary(title)))
+                added += 1
                 if len(items) >= MAX_PER_SOURCE: break
-        except Exception:
-            pass
+            log(f"ECHA 뉴스 폴백 {added}건")
+        except Exception as ex:
+            log(f"ECHA NEWS FAIL: {type(ex).__name__}: {ex}")
 
     uniq={}
     for it in items: uniq[it["url"]] = it
     return list(uniq.values())[:MAX_PER_SOURCE]
 
 def fetch_motie_generic() -> List[Dict]:
-    """MOTIE: 표(tr)와 /bbs|board|news|notice|press 링크 휴리스틱으로 추출"""
+    """MOTIE: 표(tr) + /bbs|board|news|notice|press 링크 휴리스틱"""
     items=[]
     try:
         html = http_get("https://www.motie.go.kr/")
         soup = BeautifulSoup(html, "html.parser")
 
-        # 1) 표 형태
+        added1 = 0
         for tr in soup.find_all("tr"):
             a = tr.find("a", href=True)
             if not a: continue
@@ -270,9 +288,10 @@ def fetch_motie_generic() -> List[Dict]:
             m = re.search(r"(\d{4}[.\-]\d{2}[.\-]\d{2})", txt)
             date = (m.group(1).replace(".", "-") if m else "")
             items.append(normalize("motie","MOTIE (대한민국 산업통상자원부)", title, href, date, simple_summary(title)))
+            added1 += 1
             if len(items) >= MAX_PER_SOURCE: break
 
-        # 2) 링크 휴리스틱
+        added2 = 0
         if len(items) < 10:
             for a in soup.find_all("a", href=True):
                 href=a["href"]; text=a.get_text(strip=True)
@@ -280,9 +299,11 @@ def fetch_motie_generic() -> List[Dict]:
                 if not re.search(r"/(bbs|board|news|notice|press)", href, re.I): continue
                 if not href.startswith("http"): href = "https://www.motie.go.kr" + href
                 items.append(normalize("motie","MOTIE (대한민국 산업통상자원부)", text, href, "", simple_summary(text)))
+                added2 += 1
                 if len(items) >= MAX_PER_SOURCE: break
-    except Exception:
-        pass
+        log(f"MOTIE 추출 tr:{added1}건 + link:{added2}건")
+    except Exception as ex:
+        log(f"MOTIE FAIL: {type(ex).__name__}: {ex}")
 
     uniq={}
     for it in items: uniq[it["url"]] = it
@@ -304,10 +325,13 @@ def fetch_all(selected_ids: List[str]) -> List[Dict]:
                 out += fetch_echa_legislation()
             elif s["id"]=="motie":
                 out += fetch_motie_generic()
-        except Exception:
+        except Exception as ex:
+            log(f"PIPE FAIL [{s['name']}]: {type(ex).__name__}: {ex}")
             continue
+    # dedup
     uniq={}
     for it in out: uniq[it["url"]] = it
+    log(f"총 수집 {len(uniq)}건")
     return list(uniq.values())
 
 # ---------------------------
@@ -357,20 +381,28 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-col1, col2, col3 = st.columns([2,2,2])
-with col1:
+top1, top2, top3 = st.columns([2,2,2])
+with top1:
     selected = st.multiselect(
         "수집 대상",
         [s["id"] for s in SOURCES],
         default=[s["id"] for s in SOURCES],
         format_func=lambda sid: next(s["name"] for s in SOURCES if s["id"]==sid)
     )
-with col2:
+with top2:
     since_days = st.slider("최근 N일만 보기", 3, 60, 14)
-with col3:
-    do = st.button("업데이트 실행", use_container_width=True)
+with top3:
+    colA, colB = st.columns([1,1])
+    with colA:
+        do = st.button("업데이트 실행", use_container_width=True)
+    with colB:
+        if st.button("캐시 초기화", use_container_width=True):
+            st.cache_data.clear()
+            clear_logs()
+            st.success("HTTP 캐시를 비웠습니다.")
 
 if do or "items" not in st.session_state:
+    clear_logs()
     with st.spinner("수집·요약 중..."):
         st.session_state.items = fetch_all(selected or [s["id"] for s in SOURCES])
 
@@ -403,7 +435,7 @@ df = to_dataframe(data)
 st.subheader(f"총 {len(df)}건 · 마지막 업데이트 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 st.dataframe(df, use_container_width=True, hide_index=True)
 
-# 카드 뷰
+# 카드
 st.markdown("<hr class='sep'/>", unsafe_allow_html=True)
 st.subheader("카드 보기")
 for d in data:
@@ -432,10 +464,13 @@ md = make_markdown_report(df, since_days)
 st.download_button("📄 Markdown 보고서 다운로드", data=md.encode("utf-8"),
                    file_name=f"regwatch_report_{datetime.now().strftime('%Y%m%d_%H%M')}.md",
                    mime="text/markdown")
-def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
-    buf = io.StringIO()
-    df.to_csv(buf, index=False)
-    return buf.getvalue().encode("utf-8-sig")
 st.download_button("🧾 CSV 다운로드", data=df_to_csv_bytes(df),
                    file_name=f"regwatch_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
                    mime="text/csv")
+
+# 디버그 로그
+with st.expander("디버그 로그 보기"):
+    if not st.session_state.logs:
+        st.caption("로그가 없습니다. '업데이트 실행' 후 확인하세요.")
+    else:
+        st.markdown("<small class='mono'>" + "<br/>".join(st.session_state.logs) + "</small>", unsafe_allow_html=True)
