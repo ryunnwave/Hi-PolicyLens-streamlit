@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-RegWatch – Streamlit (no paid API)
-- 기본 화면에서 원시 JSON 출력 제거(디버그 토글이 켜진 경우에만 표시)
-- LibreTranslate 연동 개선: /detect → /translate, 400/429 대응, 길이 제한, 회로차단
-- 차단 대응: r.jina.ai 프록시 + 텍스트 링크 추출 폴백
+RegWatch – Streamlit (번역 제거판)
+- 정책/규제 관련성 높은 항목만 수집/표시 (강한 필터 + 사용자 키워드)
+- 상세 페이지를 실제로 열어 본문을 추출/요약 (본문 길이 기준 미달 시 제외)
+- 차단 대응: r.jina.ai 프록시 + 텍스트 링크 폴백
+- JSON/로그는 디버그에서만 표시(기본 숨김)
 """
 
-import os, re, io, json, hashlib, time
+import os, re, io, json, hashlib
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict
 from urllib.parse import urlparse, unquote
@@ -46,7 +47,7 @@ small.mono {{ font-family: ui-monospace, Menlo, Consolas, "Courier New", monospa
 """, unsafe_allow_html=True)
 
 # ----------------------- 설정 -----------------------
-USER_AGENT = "Mozilla/5.0 (compatible; RegWatch/1.3; +https://streamlit.io)"
+USER_AGENT = "Mozilla/5.0 (compatible; RegWatch/1.4; +https://streamlit.io)"
 HEADERS = {"User-Agent": USER_AGENT, "Accept-Language": "ko,en;q=0.8"}
 TIMEOUT = 25
 MAX_PER_SOURCE = 60
@@ -59,10 +60,37 @@ SOURCES = [
     {"id": "bmuv",  "name": "BMUV (독일 환경부)", "type": "rss", "url": "https://www.bundesumweltministerium.de/meldungen.rss"},
 ]
 
-# 번역 옵션(사이드바에서 토글)
-LT_ENDPOINT = os.environ.get("LIBRE_TRANSLATE_ENDPOINT", "https://libretranslate.com")
-LT_API_KEY  = os.environ.get("LIBRE_TRANSLATE_API_KEY", "")
-DEFAULT_TR = False  # 기본 OFF
+# ----------------------- 정책/규제 관련성 판별 -----------------------
+policy_terms_en = [
+    "regulation","regulatory","law","act","bill","directive","ordinance","decree",
+    "guidance","notice","enforcement","compliance","consultation","draft","proposal",
+    "tariff","duty","quota","import","export","sanction","ban","restriction","rulemaking"
+]
+policy_terms_ko = [
+    "법","법률","법령","시행령","시행규칙","고시","훈령","지침","지시","예규",
+    "입법예고","행정예고","규정","개정","제정","시행","공고","안내","의견수렴","초안","고려안","규제"
+]
+policy_terms_de = [
+    "verordnung","gesetz","richtlinie","bekanntmachung","entwurf","änderung",
+    "umsetzung","verbot","durchführung","leitlinie","gesetzgebung"
+]
+POLICY_TERMS = [t.lower() for t in (policy_terms_en + policy_terms_ko + policy_terms_de)]
+
+def is_policy_like_text(text: str) -> bool:
+    t = (text or "").lower()
+    return any(k in t for k in POLICY_TERMS)
+
+PATH_HINTS = ["/legislation", "/law", "/directive", "/notice", "/meldungen", "/newsroom", "/press", "/regulations", "/guidance"]
+
+def has_policy_signal(item: dict) -> bool:
+    title = item.get("title","")
+    summary = item.get("summary","")
+    url = (item.get("url","") or "").lower()
+    # 1) 제목/요약에서 정책 단어
+    if is_policy_like_text(title) or is_policy_like_text(summary):
+        return True
+    # 2) URL 경로 힌트
+    return any(h in url for h in PATH_HINTS)
 
 # ----------------------- 로그 -----------------------
 if "logs" not in st.session_state: st.session_state.logs=[]
@@ -91,7 +119,7 @@ def split_sentences(text: str):
         parts = re.split(r'[.!?]\s+', t)
     return [p for p in parts if p]
 
-def simple_summary(text: str, max_sentences=2, max_len=320) -> str:
+def simple_summary(text: str, max_sentences=3, max_len=420) -> str:
     try:
         sents = split_sentences(text)
         out = " ".join(sents[:max_sentences]) if sents else clean_text(text)
@@ -138,67 +166,8 @@ def normalize(source_id, source_name, title, url, date_iso, summary)->Dict:
 def title_from_url(url: str) -> str:
     p = urlparse(url); segs = [unquote(s) for s in p.path.split("/") if s]
     if not segs: return p.netloc
-    segs = segs[-3:]; t = " / ".join(s.replace("-", " ").strip() for s in segs)
+    segs = segs[-3:]; t = " ".join(s.replace("-", " ").strip() for s in segs)
     return t.title()
-
-def looks_korean(s: str) -> bool:
-    return bool(re.search(r"[가-힣]", s or ""))
-
-# ----------------------- 번역(견고한 래퍼) -----------------------
-if "tr_fail_count" not in st.session_state: st.session_state.tr_fail_count = 0
-TR_FAIL_LIMIT = 8  # 이 이상 실패하면 해당 세션에서 번역 호출 중단(회로 차단)
-
-@st.cache_data(ttl=60*60*24, show_spinner=False)
-def lt_detect(text: str) -> str:
-    if not text: return "auto"
-    try:
-        r = requests.post(f"{LT_ENDPOINT.rstrip('/')}/detect",
-                          data={"q": text[:1000]},  # 감지만 짧게
-                          headers={"Accept":"application/json"}, timeout=15)
-        if r.status_code == 200:
-            arr = r.json()
-            if isinstance(arr, list) and arr:
-                return arr[0].get("language","auto")
-        return "auto"
-    except Exception:
-        return "auto"
-
-@st.cache_data(ttl=60*60*24, show_spinner=False)
-def lt_translate(text: str, target="ko") -> str:
-    if not text: return ""
-    # 길이 제한(과한 길이 400 오류 방지)
-    txt = text.strip()
-    if len(txt) > 1800: txt = txt[:1800]
-    src = lt_detect(txt)
-    payload = {"q": txt, "source": src, "target": target, "format":"text"}
-    if LT_API_KEY: payload["api_key"] = LT_API_KEY
-
-    # JSON 바디 우선
-    try:
-        r = requests.post(f"{LT_ENDPOINT.rstrip('/')}/translate",
-                          json=payload, headers={"Accept":"application/json"}, timeout=20)
-        if r.status_code == 200:
-            return r.json().get("translatedText") or text
-        # 폼으로 재시도
-        r2 = requests.post(f"{LT_ENDPOINT.rstrip('/')}/translate",
-                           data=payload, headers={"Accept":"application/json"}, timeout=20)
-        if r2.status_code == 200:
-            return r2.json().get("translatedText") or text
-        # 실패
-        return text
-    except Exception:
-        return text
-
-def maybe_translate(text: str, enabled: bool) -> str:
-    if not enabled or looks_korean(text) or not text:
-        return text
-    if st.session_state.tr_fail_count >= TR_FAIL_LIMIT:
-        return text
-    out = lt_translate(text, target="ko")
-    # 실패 heuristic: 동일 문자열이면 실패로 간주(X 그러나 실제 번역이 동일할 수도 있으므로 너무 공격적이면 안 됨)
-    if out == text:
-        st.session_state.tr_fail_count += 1
-    return out
 
 # ----------------------- HTTP + 폴백 -----------------------
 @st.cache_data(ttl=1500, show_spinner=False)
@@ -241,6 +210,45 @@ def extract_links_from_text(text: str, domain: str, include: List[str]=None, lim
             seen[u] = True
             if len(seen) >= limit: break
     return list(seen.keys())
+
+# ----------------------- 상세 페이지 본문 추출 -----------------------
+def extract_page_text(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    # 1) 메타 설명
+    meta = soup.find("meta", attrs={"name":"description"}) or soup.find("meta", attrs={"property":"og:description"})
+    if meta and meta.get("content"): return clean_text(meta["content"])
+    # 2) 본문 후보
+    candidates = []
+    for sel in ["article", "main", "[role=main]", ".content", ".article", ".post", ".text", ".richtext", ".body-content"]:
+        for tag in soup.select(sel):
+            txt = tag.get_text(" ", strip=True)
+            if txt and len(txt) > 120:
+                candidates.append(txt)
+    if candidates: return max(candidates, key=len)
+    # 3) 일반 p 태그 앞부분
+    ps = soup.find_all("p")
+    txt = " ".join(p.get_text(" ", strip=True) for p in ps[:5])
+    return clean_text(txt)
+
+def scrape_detail_summary(url: str) -> Dict[str, str]:
+    """상세 페이지를 열어 본문 및 날짜 후보를 추출."""
+    out = {"body":"","date":""}
+    try:
+        html = fetch_with_fallback(url)
+        body = extract_page_text(html)
+        out["body"] = clean_text(body)
+        soup = BeautifulSoup(html, "html.parser")
+        # 날짜 후보
+        dt_tag = soup.find("time") or soup.find("meta", attrs={"property":"article:published_time"}) \
+                 or soup.find("meta", attrs={"name":"date"})
+        if dt_tag:
+            if dt_tag.name == "meta":
+                out["date"] = dt_tag.get("content","")
+            else:
+                out["date"] = dt_tag.get("datetime","") or dt_tag.get_text(strip=True)
+    except Exception as ex:
+        log(f"상세 추출 실패: {type(ex).__name__}")
+    return out
 
 # ----------------------- 수집기 -----------------------
 def fetch_rss_one(source_id, name, feed_url)->List[Dict]:
@@ -423,7 +431,7 @@ def fetch_bmuv_html_fallback()->List[Dict]:
     uniq={}; [uniq.setdefault(it["url"], it) for it in items]
     return list(uniq.values())[:MAX_PER_SOURCE]
 
-# 전체 파이프라인
+# ----------------------- 전체 파이프라인 -----------------------
 def fetch_all(selected_ids:List[str])->List[Dict]:
     out=[]
     for s in SOURCES:
@@ -442,7 +450,7 @@ def fetch_all(selected_ids:List[str])->List[Dict]:
         except Exception as ex:
             log(f"PIPE FAIL [{s['name']}]: {type(ex).__name__}: {ex}")
     uniq={}; [uniq.setdefault(it["url"], it) for it in out]
-    log(f"총 수집 {len(uniq)}건")
+    log(f"총 수집 {len(uniq)}건 (후처리 전)")
     return list(uniq.values())
 
 # ----------------------- 보고서/다운로드 -----------------------
@@ -468,39 +476,42 @@ def make_markdown_report(df:pd.DataFrame, since_days:int)->str:
         lines.append(f"- **[{r['title']}]({r['url']})**  \n  - 기관: {r['agency']} | 국가: {r['country']} | 분류: {r['category']} | 영향도: {r['impact']}  \n  - 날짜: {r['date']}")
     return "\n".join(lines)
 
-def df_to_csv_bytes(df:pd.DataFrame)->bytes:
-    buf=io.StringIO(); df.to_csv(buf, index=False); return buf.getvalue().encode("utf-8-sig")
-
 # ----------------------- UI -----------------------
-st.markdown(f"<div class='big-header'><span class='brand-title'>RegWatch</span> 글로벌 규제 모니터링 (API 없이 간이요약)</div>", unsafe_allow_html=True)
+st.markdown(f"<div class='big-header'><span class='brand-title'>RegWatch</span> 글로벌 규제 모니터링 (정책/규제 전용 · 번역 없음)</div>", unsafe_allow_html=True)
 
-t1,t2,t3=st.columns([2,2,2])
+t1,t2,t3=st.columns([2,2,3])
 with t1:
     selected=st.multiselect("수집 대상", [s["id"] for s in SOURCES],
         default=[s["id"] for s in SOURCES],
         format_func=lambda sid: next(s["name"] for s in SOURCES if s["id"]==sid))
 with t2:
-    since_days=st.slider("최근 N일만 보기", 3, 60, 14)
+    since_days=st.slider("최근 N일만 보기", 3, 90, 14)
 with t3:
-    a,b=st.columns([1,1])
-    with a:
-        do=st.button("업데이트 실행", use_container_width=True)
-    with b:
-        if st.button("캐시 초기화", use_container_width=True):
-            st.cache_data.clear(); clear_logs(); st.success("HTTP 캐시를 비웠습니다.")
+    min_body_chars = st.slider("본문 최소 길이(요약 가능 기준)", 80, 800, 200, step=20,
+                               help="상세 페이지에서 추출한 본문 길이가 이 값 미만이면 제외합니다.")
 
-with st.sidebar:
-    enable_tr = st.checkbox("자동 한국어 번역(실험적)", value=DEFAULT_TR)
-    show_debug = st.checkbox("디버그 모드", value=False)
-    st.markdown("<div class='warn'>공용 LibreTranslate는 느리거나 제한될 수 있습니다. 안정성이 필요하면 \
-    <b>LIBRE_TRANSLATE_ENDPOINT</b> 및 <b>LIBRE_TRANSLATE_API_KEY</b>를 설정하세요.</div>", unsafe_allow_html=True)
+a,b,c=st.columns([1,1,1])
+with a:
+    do=st.button("업데이트 실행", use_container_width=True)
+with b:
+    if st.button("캐시 초기화", use_container_width=True):
+        st.cache_data.clear(); clear_logs(); st.success("HTTP 캐시를 비웠습니다.")
+with c:
+    show_debug = st.toggle("디버그 모드", value=False)
 
-if do or "items" not in st.session_state:
+st.markdown("<hr class='sep'/>", unsafe_allow_html=True)
+pol_col1, pol_col2 = st.columns([1,2])
+with pol_col1:
+    policy_only = st.checkbox("정책/규제 관련 항목만 보기(강한 필터)", value=True)
+with pol_col2:
+    user_terms = st.text_input("추가 포함 키워드(쉼표로 구분, 선택)", value="PFAS, REACH, CLP")
+
+if do or "items_raw" not in st.session_state:
     clear_logs()
     with st.spinner("수집 중..."):
-        st.session_state.items = fetch_all(selected or [s["id"] for s in SOURCES])
+        st.session_state.items_raw = fetch_all(selected or [s["id"] for s in SOURCES])
 
-items = st.session_state.get("items", [])
+items = st.session_state.get("items_raw", [])
 
 # 기간 필터
 cut = datetime.now(timezone.utc) - timedelta(days=since_days)
@@ -509,12 +520,41 @@ def in_range(iso):
     except: return True
 items_recent=[d for d in items if in_range(d["dateIso"])]
 
+# 상세 페이지 요약 보강 + 정책/본문 필터
+def matches_user_terms(item):
+    terms = [t.strip().lower() for t in user_terms.split(",") if t.strip()]
+    if not terms: return True
+    s = (item.get("title","") + " " + item.get("summary","")).lower()
+    return any(t in s for t in terms)
+
+processed=[]
+with st.spinner("상세 페이지 분석 및 요약 중..."):
+    for it in items_recent:
+        # 상세페이지 크롤링
+        detail = scrape_detail_summary(it["url"])
+        body = detail.get("body","")
+        if detail.get("date"):
+            it["dateIso"] = to_iso(detail["date"])
+        # 본문 길이 기준
+        if len(body) < min_body_chars:
+            continue
+        # 간단 요약
+        it["summary"] = simple_summary(body, 3, 420)
+        # 정책/규제 필터
+        if policy_only and not has_policy_signal(it):
+            continue
+        # 사용자 키워드
+        if not matches_user_terms(it):
+            continue
+        processed.append(it)
+
 # 검색/카테고리
 st.markdown("<hr class='sep'/>", unsafe_allow_html=True)
 f1,f2=st.columns([2,2])
 with f1: q=st.text_input("검색어(제목/요약/기관/국가)")
 with f2: cat=st.selectbox("카테고리", ["전체","화학물질규제","무역정책","산업정책","환경규제"], index=0)
-data=items_recent
+
+data=processed
 if q:
     ql=q.lower()
     data=[d for d in data if ql in (d["title"]+" "+d["summary"]+" "+d["sourceName"]+" "+d.get("country","")).lower()]
@@ -522,7 +562,15 @@ if cat!="전체":
     data=[d for d in data if d["category"]==cat]
 
 # 표
-df=to_dataframe(data)
+df = pd.DataFrame([{
+    "date": d["dateIso"], "title": d["title"], "agency": d["sourceName"], "country": d.get("country",""),
+    "category": d["category"], "impact": d["impact"], "url": d["url"]
+} for d in data])
+try:
+    df["date_dt"]=pd.to_datetime(df["date"], errors="coerce")
+    df=df.sort_values("date_dt", ascending=False).drop(columns=["date_dt"])
+except: pass
+
 st.subheader(f"총 {len(df)}건 · 마지막 업데이트 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 st.dataframe(df, use_container_width=True, hide_index=True)
 
@@ -540,13 +588,10 @@ for d in data:
     status="EFFECTIVE" if d["impact"]=="High" else ("DRAFT" if d["impact"]=="Medium" else "ANNOUNCED")
     status_class={"ANNOUNCED":"badge status-ann","DRAFT":"badge status-draft","EFFECTIVE":"badge status-eff"}[status]
 
-    title_disp   = maybe_translate(d["title"],   enable_tr)
-    summary_disp = maybe_translate(d["summary"], enable_tr)
-
     st.markdown(f"<div class='card {'new' if is_new else ''}'>", unsafe_allow_html=True)
     st.markdown(f"<span class='badge {cat_class}'>{d['category']}</span> <span class='badge kor'>{d.get('country','')}</span> <span class='{status_class}'>{status}</span>", unsafe_allow_html=True)
-    st.markdown(f"<h4>{title_disp}</h4>", unsafe_allow_html=True)
-    st.write(summary_disp or "")
+    st.markdown(f"<h4>{d['title']}</h4>", unsafe_allow_html=True)
+    st.write(d.get("summary",""))
     st.markdown(f"<div class='meta'><b>기관</b>·{d['sourceName']} | <b>날짜</b>·{d['dateIso']}</div>", unsafe_allow_html=True)
     if kw: st.markdown(" ".join([f"<span class='keyword'>{k}</span>" for k in kw]), unsafe_allow_html=True)
     st.markdown(f"[원문 보기]({d['url']})")
@@ -555,15 +600,21 @@ for d in data:
 # 보고서/다운로드
 st.markdown("<hr class='sep'/>", unsafe_allow_html=True)
 st.subheader("보고서 생성")
-md=make_markdown_report(df, since_days)
+md = ( "# 규제/뉴스 업데이트 보고서\n\n"
+       f"- 생성 시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+       f"- 기준: 최근 {since_days}일\n"
+       f"- 총 항목: {len(df)}건\n\n" )
+for _,r in df.iterrows():
+    md += f"- **[{r['title']}]({r['url']})** — {r['agency']} · {r['country']} · {r['category']} · {r['date']}\n"
 st.download_button("📄 Markdown 보고서 다운로드", data=md.encode("utf-8"),
                    file_name=f"regwatch_report_{datetime.now().strftime('%Y%m%d_%H%M')}.md", mime="text/markdown")
-st.download_button("🧾 CSV 다운로드", data=df_to_csv_bytes(df),
+st.download_button("🧾 CSV 다운로드", data=df.to_csv(index=False).encode("utf-8-sig"),
                    file_name=f"regwatch_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", mime="text/csv")
 
-# 디버그(토글 OFF면 절대 표시하지 않음)
+# 디버그(기본 숨김)
 if show_debug:
     with st.expander("디버그: 원시 데이터 / 로그 보기", expanded=False):
         st.json(items, expanded=False)
         if st.session_state.logs:
             st.markdown("<small class='mono'>"+"<br/>".join(st.session_state.logs)+"</small>", unsafe_allow_html=True)
+
