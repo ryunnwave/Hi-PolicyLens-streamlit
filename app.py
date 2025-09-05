@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-RegWatch – Streamlit (no external API key)
-- 버그 수정: 문장분할 정규식 PatternError 제거
-- 폴백 강화: RSS/HTML 차단 시 r.jina.ai 텍스트 프록시 + 텍스트에서 URL 추출
-- 대상: ECHA, CBP(press+trade), MOTIE, BMUV
+RegWatch – Streamlit (no paid API)
+- JSON 노출 기본 숨김(디버그 섹션에서만 표시)
+- 한국어 번역 옵션 추가 (LibreTranslate 공용/개인 엔드포인트 지원)
+- 차단 대응: r.jina.ai 프록시 + 텍스트 링크 추출 폴백
 """
 
-import re, io, json, hashlib
+import os, re, io, json, hashlib
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict
 from urllib.parse import urlparse, unquote
@@ -16,7 +16,7 @@ from bs4 import BeautifulSoup
 from dateutil import parser as dtparse
 import streamlit as st
 
-# ----------------------- UI -----------------------
+# ----------------------- UI / 스타일 -----------------------
 st.set_page_config(page_title="RegWatch – 글로벌 규제 모니터링", layout="wide")
 BRAND = "#0f2e69"; ACCENT = "#dc8d32"
 st.markdown(f"""
@@ -41,11 +41,12 @@ html, body, [class*="css"] {{ font-family: 'Pretendard', -apple-system, BlinkMac
 .meta {{ color:#64748b; font-size:12px; margin-top:6px; }}
 hr.sep {{ border:none; border-top:1px solid #e2e8f0; margin:16px 0; }}
 small.mono {{ font-family: ui-monospace, Menlo, Consolas, "Courier New", monospace; }}
+.warn {{ font-size:12px; color:#92400e; background:#fff7ed; padding:8px 10px; border:1px solid #fed7aa; border-radius:8px; }}
 </style>
 """, unsafe_allow_html=True)
 
 # ----------------------- 설정 -----------------------
-USER_AGENT = "Mozilla/5.0 (compatible; RegWatch/1.1; +https://streamlit.io)"
+USER_AGENT = "Mozilla/5.0 (compatible; RegWatch/1.2; +https://streamlit.io)"
 HEADERS = {"User-Agent": USER_AGENT, "Accept-Language": "ko,en;q=0.8"}
 TIMEOUT = 25
 MAX_PER_SOURCE = 60
@@ -57,6 +58,11 @@ SOURCES = [
     {"id": "motie", "name": "MOTIE (대한민국 산업통상자원부)", "type": "html", "url": "https://www.motie.go.kr/"},
     {"id": "bmuv",  "name": "BMUV (독일 환경부)", "type": "rss", "url": "https://www.bundesumweltministerium.de/meldungen.rss"},
 ]
+
+# 번역 설정(옵션)
+LT_ENDPOINT = os.environ.get("LIBRE_TRANSLATE_ENDPOINT", "https://libretranslate.com")
+LT_API_KEY  = os.environ.get("LIBRE_TRANSLATE_API_KEY", "")
+ENABLE_TRANSLATION_DEFAULT = False   # 처음엔 꺼둠(과도한 호출 방지)
 
 # ----------------------- 로그 -----------------------
 if "logs" not in st.session_state: st.session_state.logs=[]
@@ -77,8 +83,8 @@ def to_iso(s:str)->str:
 def clean_text(s:str)->str: return re.sub(r"\s+"," ", (s or "")).strip()
 
 def split_sentences(text: str):
-    """고정폭 lookbehind 조합으로 PatternError 방지"""
     t = clean_text(text)
+    # 고정폭 lookbehind 조합(오류 방지)
     pattern = r'(?:(?<=\.)|(?<=!)|(?<=\?)|(?<=다\.)|(?<=요\.))\s+'
     try:
         parts = re.split(pattern, t)
@@ -138,17 +144,43 @@ def title_from_url(url: str) -> str:
     t = " / ".join(s.replace("-", " ").strip() for s in segs)
     return t.title()
 
+def looks_korean(s: str) -> bool:
+    return bool(re.search(r"[가-힣]", s or ""))
+
+# ----------------------- 번역(옵션) -----------------------
+@st.cache_data(ttl=60*60*24, show_spinner=False)
+def libre_translate(text: str, target="ko", source="auto") -> str:
+    """LibreTranslate 사용(공용/개인 엔드포인트). 키 없으면 무키로 시도(제한/지연 가능)."""
+    if not text: return ""
+    try:
+        resp = requests.post(
+            f"{LT_ENDPOINT.rstrip('/')}/translate",
+            data={"q": text, "source": source, "target": target, "format": "text", **({"api_key": LT_API_KEY} if LT_API_KEY else {})},
+            headers={"Accept": "application/json"},
+            timeout=20,
+        )
+        if resp.status_code == 200:
+            j = resp.json()
+            return j.get("translatedText") or text
+        else:
+            log(f"번역 실패 HTTP {resp.status_code}")
+            return text
+    except Exception as ex:
+        log(f"번역 예외: {type(ex).__name__}")
+        return text
+
+def maybe_translate(text: str, enabled: bool) -> str:
+    if not enabled or looks_korean(text):  # 이미 한국어면 생략
+        return text
+    return libre_translate(text, target="ko", source="auto")
+
 # ----------------------- HTTP + 폴백 -----------------------
 @st.cache_data(ttl=1500, show_spinner=False)
 def http_get(url:str)->str:
-    r=requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-    r.raise_for_status()
-    return r.text
+    r=requests.get(url, headers=HEADERS, timeout=TIMEOUT); r.raise_for_status(); return r.text
 
 def http_get_bytes(url:str)->bytes:
-    r=requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-    r.raise_for_status()
-    return r.content
+    r=requests.get(url, headers=HEADERS, timeout=TIMEOUT); r.raise_for_status(); return r.content
 
 def fetch_with_fallback(url:str)->str:
     try:
@@ -173,7 +205,6 @@ def fetch_bytes_with_fallback(url:str)->bytes:
         return txt.encode("utf-8", errors="ignore")
 
 def extract_links_from_text(text: str, domain: str, include: List[str]=None, limit=80) -> List[str]:
-    """프록시 텍스트에서 해당 도메인의 URL만 추출"""
     pat = rf'https?://(?:www\.)?{re.escape(domain)}/[^\s\)\"\']+'
     urls = re.findall(pat, text)
     if include:
@@ -243,7 +274,6 @@ def fetch_echa_legislation()->List[Dict]:
     except Exception as ex:
         log(f"ECHA FAIL {type(ex).__name__}: {ex}")
 
-    # 텍스트 프록시에서 URL만 추출(마지막 폴백)
     if len(items)<5:
         try:
             txt = fetch_with_fallback("https://echa.europa.eu/legislation")
@@ -291,7 +321,6 @@ def fetch_motie_generic()->List[Dict]:
         log(f"MOTIE FAIL {type(ex).__name__}: {ex}")
 
     if len(items)<5:
-        # 텍스트에서 링크 추출 폴백
         try:
             txt = fetch_with_fallback("https://www.motie.go.kr/")
             links = extract_links_from_text(txt, "www.motie.go.kr", include=["bbs","board","news","press","notice"], limit=50)
@@ -307,10 +336,8 @@ def fetch_motie_generic()->List[Dict]:
 
 def fetch_cbp_html_fallback()->List[Dict]:
     items=[]
-    pages=[
-        ("https://www.cbp.gov/newsroom", "U.S. Customs and Border Protection (CBP)"),
-        ("https://www.cbp.gov/trade", "U.S. Customs and Border Protection (CBP)")
-    ]
+    pages=[("https://www.cbp.gov/newsroom", "U.S. Customs and Border Protection (CBP)"),
+           ("https://www.cbp.gov/trade", "U.S. Customs and Border Protection (CBP)")]
     added=0
     for url, name in pages:
         try:
@@ -327,7 +354,6 @@ def fetch_cbp_html_fallback()->List[Dict]:
             log(f"CBP HTML FAIL {type(ex).__name__}: {ex}")
 
     if len(items)<5:
-        # 텍스트 링크 추출 폴백
         try:
             for url,_ in pages:
                 txt = fetch_with_fallback(url)
@@ -437,9 +463,15 @@ with t3:
         if st.button("캐시 초기화", use_container_width=True):
             st.cache_data.clear(); clear_logs(); st.success("HTTP 캐시를 비웠습니다.")
 
+# 번역 토글(사이드): 기본 꺼짐
+with st.sidebar:
+    enable_tr = st.checkbox("자동 한국어 번역(실험적)", value=ENABLE_TRANSLATION_DEFAULT)
+    st.markdown("<div class='warn'>공용 엔드포인트는 느리거나 제한될 수 있습니다. 안정성이 필요하면 \
+    <b>LIBRE_TRANSLATE_ENDPOINT</b>와 <b>LIBRE_TRANSLATE_API_KEY</b> 환경변수를 설정하세요.</div>", unsafe_allow_html=True)
+
 if do or "items" not in st.session_state:
     clear_logs()
-    with st.spinner("수집·요약 중..."):
+    with st.spinner("수집 중..."):
         st.session_state.items = fetch_all(selected or [s["id"] for s in SOURCES])
 
 items = st.session_state.get("items", [])
@@ -480,10 +512,15 @@ for d in data:
     cat_class={"화학물질규제":"cat-chem","무역정책":"cat-trade","산업정책":"cat-ind","환경규제":"cat-env"}.get(d["category"],"")
     status="EFFECTIVE" if d["impact"]=="High" else ("DRAFT" if d["impact"]=="Medium" else "ANNOUNCED")
     status_class={"ANNOUNCED":"badge status-ann","DRAFT":"badge status-draft","EFFECTIVE":"badge status-eff"}[status]
+
+    # 번역(필요 시)
+    title_disp   = maybe_translate(d["title"],   enable_tr)
+    summary_disp = maybe_translate(d["summary"], enable_tr)
+
     st.markdown(f"<div class='card {'new' if is_new else ''}'>", unsafe_allow_html=True)
     st.markdown(f"<span class='badge {cat_class}'>{d['category']}</span> <span class='badge kor'>{d.get('country','')}</span> <span class='{status_class}'>{status}</span>", unsafe_allow_html=True)
-    st.markdown(f"<h4>{d['title']}</h4>", unsafe_allow_html=True)
-    st.write(d["summary"] or "")
+    st.markdown(f"<h4>{title_disp}</h4>", unsafe_allow_html=True)
+    st.write(summary_disp or "")
     st.markdown(f"<div class='meta'><b>기관</b>·{d['sourceName']} | <b>날짜</b>·{d['dateIso']}</div>", unsafe_allow_html=True)
     if kw: st.markdown(" ".join([f"<span class='keyword'>{k}</span>" for k in kw]), unsafe_allow_html=True)
     st.markdown(f"[원문 보기]({d['url']})")
@@ -498,7 +535,9 @@ st.download_button("📄 Markdown 보고서 다운로드", data=md.encode("utf-8
 st.download_button("🧾 CSV 다운로드", data=df_to_csv_bytes(df),
                    file_name=f"regwatch_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", mime="text/csv")
 
-# 로그
-with st.expander("디버그 로그 보기"):
-    if not st.session_state.logs: st.caption("로그가 없습니다. '업데이트 실행' 후 확인하세요.")
-    else: st.markdown("<small class='mono'>"+"<br/>".join(st.session_state.logs)+"</small>", unsafe_allow_html=True)
+# 디버그(기본 숨김) ─ JSON 노출 방지
+with st.expander("디버그: 원시 데이터 / 로그 보기"):
+    st.caption("원시 데이터와 수집 로그를 점검할 때만 펼치세요.")
+    st.json(items, expanded=False)
+    if st.session_state.logs:
+        st.markdown("<small class='mono'>"+"<br/>".join(st.session_state.logs)+"</small>", unsafe_allow_html=True)
