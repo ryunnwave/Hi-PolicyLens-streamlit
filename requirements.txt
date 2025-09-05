@@ -1,6 +1,7 @@
-streamlit
-requests
-feedparser
-beautifulsoup4
-pandas
-python-dateutil
+streamlit>=1.36.0
+requests>=2.31.0
+beautifulsoup4>=4.12.3
+lxml>=5.2.1
+pandas>=2.1.4
+python-dateutil>=2.9.0.post0
+feedparser>=6.0.11
