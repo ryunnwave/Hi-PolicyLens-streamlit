@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-RegWatch – 카드형 강화요약 (정책/본문 필터 제거)
-- 모든 항목 수집 후: 상세 페이지/또는 PDF 본문을 읽어 구조적 요약 생성
-- 하이라이트(주요 변경사항), 담당기관, 시행일자/발효일 추정, 영향범위, 태그 자동화
-- 기존 소스 + 요청 소스(BReg Aktuelles, CBP Bulletin PDF, DOE Newsroom)
+RegWatch – 카드형 강화요약 (정책/본문 필터 없음 / 재귀 오류 수정판)
+- 모든 항목 수집 → 상세 페이지/또는 PDF 본문을 읽어 구조적 요약 생성
+- 하이라이트(주요 변경사항), 시행/발효 추정, 영향 범위, 태그 자동화
+- 소스: EEA Analysis, CBP RSS, BMUV RSS, MOTIE 루트, Bundesregierung Aktuelles,
+        CBP Bulletin(페이지 내 PDF), U.S. DOE Newsroom
 """
 
 import re, io, hashlib
@@ -36,10 +37,10 @@ st.markdown(f"""
 @import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.8/dist/web/static/pretendard.css');
 :root {{ --brand:{BRAND}; --accent:{ACCENT}; --muted:#8aa0c6; --ink:#0b1a3a; }}
 html, body, [class*="css"] {{ font-family:'Pretendard', -apple-system, BlinkMacSystemFont, system-ui, Roboto, sans-serif; }}
-.main {{ background: #f6f8fb; }}
+.main {{ background:#f6f8fb; }}
 .hero {{
   background: linear-gradient(135deg, {BG} 0%, #1a4b8c 100%);
-  color:#fff; padding:18px 22px; border-radius:14px; margin: 6px 0 14px;
+  color:#fff; padding:18px 22px; border-radius:14px; margin:6px 0 14px;
   box-shadow:0 6px 20px rgba(0,0,0,.12)
 }}
 .hero .title {{ font-size:24px; font-weight:900; margin:0 }}
@@ -71,19 +72,19 @@ a.btn {{
   display:inline-block; background:#fff; color:#0f2e69; font-weight:800; font-size:13px;
   padding:8px 14px; border-radius:10px; text-decoration:none; border:1px solid #e2e8f0;
 }}
-small.mono {{ font-family: ui-monospace, Menlo, Consolas, "Courier New", monospace; color:#9fb5db }}
+small.mono {{ font-family:ui-monospace,Menlo,Consolas,"Courier New",monospace; color:#9fb5db }}
 </style>
 """, unsafe_allow_html=True)
 
 st.markdown(f"""
 <div class="hero">
   <div class="title">RegWatch <span class="badge">강화요약</span></div>
-  <div class="subtitle">정책/본문 필터 없이 수집한 뒤, 상세 본문·PDF를 읽어 카드형 요약을 생성합니다.</div>
+  <div class="subtitle">필터 없이 수집 → 상세 본문·PDF를 읽어 카드형 요약을 생성합니다.</div>
 </div>
 """, unsafe_allow_html=True)
 
 # ----------------------- 소스 정의 -----------------------
-USER_AGENT = "Mozilla/5.0 (compatible; RegWatch/2.0; +https://streamlit.io)"
+USER_AGENT = "Mozilla/5.0 (compatible; RegWatch/2.1; +https://streamlit.io)"
 HEADERS = {"User-Agent": USER_AGENT, "Accept-Language": "ko,en;q=0.8"}
 TIMEOUT = 25
 MAX_PER_SOURCE = 60
@@ -94,12 +95,10 @@ SOURCES = [
      "urls":["https://www.cbp.gov/rss/trade","https://www.cbp.gov/rss/press-releases"]},
     {"id":"bmuv",  "name":"BMUV – Meldungen RSS", "type":"rss", "url":"https://www.bundesumweltministerium.de/meldungen.rss"},
     {"id":"motie", "name":"MOTIE (산업부) 루트", "type":"html", "url":"https://www.motie.go.kr/"},
-    # 요청 소스
     {"id":"bund",  "name":"Bundesregierung – Aktuelles", "type":"html", "url":"https://www.bundesregierung.de/breg-de/aktuelles"},
     {"id":"cbp_bull","name":"CBP – Bulletin/Decisions (PDF)", "type":"html", "url":"https://www.cbp.gov/trade/rulings/bulletin-decisions"},
     {"id":"doe",   "name":"U.S. DOE – Newsroom", "type":"html", "url":"https://www.energy.gov/newsroom"},
 ]
-
 COUNTRY = {"cbp":"미국","cbp_bull":"미국","bmuv":"독일","motie":"대한민국","eea":"EU","bund":"독일","doe":"미국"}
 
 # ----------------------- 로그 -----------------------
@@ -113,7 +112,7 @@ def clean(s:str)->str: return re.sub(r"\s+"," ", (s or "")).strip()
 def to_iso(s:str)->str:
     if not s: return datetime.now(timezone.utc).isoformat()
     try:
-        d=dtparse.parse(s); d = d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+        d=dtparse.parse(s); d=d if d.tzinfo else d.replace(tzinfo=timezone.utc)
         return d.astimezone(timezone.utc).isoformat()
     except Exception:
         return datetime.now(timezone.utc).isoformat()
@@ -124,7 +123,8 @@ def title_from_url(url:str)->str:
     return " / ".join(segs[-3:]).replace("-"," ").title()
 
 def extract_keywords(text:str, topn=6):
-    stop=set(["the","and","for","with","from","that","this","are","was","were","will","have","has","been","on","of","in","to","a","an","by","및","과","에","의","으로","대한","관련"])
+    stop=set(["the","and","for","with","from","that","this","are","was","were","will","have","has","been","on","of","in","to","a","an","by",
+              "및","과","에","의","으로","대한","관련"])
     words=re.sub(r"[^a-z0-9가-힣 ]"," ", (text or "").lower()).split()
     freq={}
     for w in words:
@@ -135,7 +135,7 @@ def extract_keywords(text:str, topn=6):
 def guess_category(title:str)->str:
     t=(title or "").lower()
     if re.search(r"(reach|clp|pfas|biocide|chemical|substance|restriction|authorisation)", t): return "화학물질규제"
-    if re.search(r"(tariff|duty|quota|fee|rate|import|export|cbp|customs|ruling|bulletin)", t): return "무역정책"
+    if re.search(r"(tariff|duty|quota|rate|import|export|cbp|customs|ruling|bulletin)", t): return "무역정책"
     if re.search(r"(environment|climate|emission|umwelt|환경|energy|전력|에너지)", t): return "환경규제"
     if re.search(r"(policy|industry|manufactur|산업|전략|투자)", t): return "산업정책"
     return "산업정책"
@@ -222,22 +222,23 @@ def split_sents(text:str)->List[str]:
     except re.error: s=re.split(r'[.!?]\s+', t)
     return [x.strip() for x in s if x.strip()]
 
-def pick_highlights(text:str, topn=5)->List[str]:
-    sents=split_sents(text)
-    hits=[s for s in sents if re.search(HL_WORDS, s, re.I)]
-    if not hits: hits=sents[:topn]
-    # 중복/길이 정리
-    seen=set(); out=[]
+def pick_highlights(text: str, topn=5) -> List[str]:
+    sents = split_sents(text)
+    hits = [s for s in sents if re.search(HL_WORDS, s, re.I)]
+    if not hits:
+        hits = sents[:topn]
+    seen, out = set(), []
     for h in hits:
-        key=h.lower()
-        if key in seen: continue
+        key = h.lower()
+        if key in seen:
+            continue
         seen.add(key)
         out.append(h[:220])
-        if len(out)>=topn: break
+        if len(out) >= topn:
+            break
     return out
 
 def guess_effective_date(text:str)->str:
-    # 규정상 정확히 못 찾으면 빈 값 반환
     m=re.search(r"(effective|applicable|enforce(?:ment)?|시행|발효)[^\.]{0,40}?"+DATE_PAT, text, re.I)
     if not m:
         m=re.search(DATE_PAT, text)
@@ -255,15 +256,21 @@ def guess_scope(text:str)->str:
     if re.search(r"financial|bank|insurance", t): scope.append("금융")
     return " · ".join(scope) or "일반 기업/기관"
 
-def strengthen_summary(title:str, body:str)->Dict[str,str]:
-    # 구조적 요약 산출
-    sents=split_sents(body)
-    abstract=" ".join(sents[:3])[:480] if sents else body[:480]
-    bullets=pick_highlights(body, topn=4)
-    eff=guess_effective_date(body)
-    scope=guess_scope(body)
-    tags=extract_keywords(title+" "+body, topn=6)
-    return {"abstract":abstract, "bullets":bullets, "effective":eff, "scope":scope, "tags":tags}
+def strengthen_summary(title: str, body: str, power: int = 4) -> Dict[str, str]:
+    """요약 강도(power)를 인자로 받아 재귀 없이 길이/하이라이트 개수만 조절"""
+    sents = split_sents(body)
+    abs_sent_n = min(2 + power, 6)                    # 3~6문장
+    abstract = " ".join(sents[:abs_sent_n])[:480] if sents else body[:480]
+
+    hl_topn = min(2 + power, 8)                       # 3~8개
+    bullets = pick_highlights(body, topn=hl_topn)
+    if not bullets:
+        bullets = sents[:min(3, len(sents))]
+
+    eff = guess_effective_date(body)
+    scope = guess_scope(body)
+    tags = extract_keywords(title + " " + body, topn=6)
+    return {"abstract": abstract, "bullets": bullets, "effective": eff, "scope": scope, "tags": tags}
 
 def scrape_detail(url:str)->Dict[str,str]:
     out={"body":"","date":""}
@@ -283,7 +290,7 @@ def scrape_detail(url:str)->Dict[str,str]:
         log(f"상세 추출 실패: {type(ex).__name__}")
     return out
 
-# ----------------------- 수집기 (간결) -----------------------
+# ----------------------- 수집기 -----------------------
 def normalize(source_id, name, title, url, date_iso, summary)->Dict:
     if not url: return {}
     return {
@@ -336,7 +343,6 @@ def fetch_links_by_contains(url, must_contains:str, sid, name, base=None):
     return list(uniq.values())[:MAX_PER_SOURCE]
 
 def fetch_motie_root():
-    # 루트에서 게시판 추정 + 링크 폴백
     return fetch_links_by_contains("https://www.motie.go.kr/", "", "motie", "MOTIE", base="https://www.motie.go.kr/")
 
 def fetch_all(selected)->List[Dict]:
@@ -371,9 +377,9 @@ with c2:
     since_days=st.slider("최근 N일", 3, 90, 14)
 with c3:
     summary_power=st.select_slider("요약 강도", options=[1,2,3,4,5], value=4,
-        help="값이 클수록 요약을 조금 더 길고 자세히 생성(문장수↑, 하이라이트↑)")
+        help="값이 클수록 요약을 길고/하이라이트 더 많이 생성")
 with c4:
-    user_terms=st.text_input("추가 키워드(선택, 쉼표구분)", value="PFAS, REACH, CLP, draft, 개정")
+    user_terms=st.text_input("추가 키워드(선택, 쉼표구분)", value="")  # 검색에만 사용
 
 a,b,d = st.columns([1,1,2])
 with a:
@@ -407,20 +413,14 @@ with st.spinner("상세 본문/ PDF 요약 생성 중..."):
     for it in items:
         detail = scrape_detail(it["url"])
         body = detail.get("body","")
-        if not body or len(body)<60:
-            # 본문이 너무 짧으면 원래 summary라도 사용
+        if not body or len(body) < 60:
             body = it.get("summary") or title_from_url(it["url"])
         if detail.get("date"): it["dateIso"] = to_iso(detail["date"])
-        # 강도에 따라 문장 수/하이라이트 수 조정
-        ori_pick = pick_highlights
-        def pick_highlights_dyn(text:str, topn=4):
-            return ori_pick(text, topn=(2+summary_power))
-        globals()['pick_highlights'] = pick_highlights_dyn
-        y = strengthen_summary(it["title"], body)
+        y = strengthen_summary(it["title"], body, power=summary_power)
         it.update({
             "abs": y["abstract"],
             "bullets": y["bullets"],
-            "effective": y["effective"] or "",
+            "effective": y["effective"] or "-",
             "scope": y["scope"],
             "tags": y["tags"],
         })
@@ -436,7 +436,7 @@ k4.markdown(f"<div class='kpi'><div class='num'>{datetime.now().strftime('%Y-%m-
 # 검색/카테고리
 st.markdown("<hr class='sep'/>", unsafe_allow_html=True)
 f1,f2 = st.columns([2,1])
-with f1: q=st.text_input("검색(제목/요약/기관/국가)")
+with f1: q=st.text_input("검색(제목/요약/기관/국가)", value=user_terms)
 with f2: cat=st.selectbox("카테고리", ["전체","화학물질규제","무역정책","산업정책","환경규제"])
 
 data=processed
@@ -459,7 +459,7 @@ except: pass
 st.subheader(f"목록 · 총 {len(df)}건")
 st.dataframe(df, use_container_width=True, hide_index=True)
 
-# 카드 (샘플처럼 리치하게)
+# 카드
 def days_new(iso:str, days=7):
     try: d=dtparse.parse(iso); d=d if d.tzinfo else d.replace(tzinfo=timezone.utc)
     except Exception: return False
@@ -486,7 +486,7 @@ for d in data:
 
     st.markdown("<div class='section'><h4>⚡ 주요 변경사항</h4><ul>"+bl_html+"</ul></div>", unsafe_allow_html=True)
 
-    eff = d.get("effective","") or "-"
+    eff = d.get("effective","-")
     st.markdown(
         f"<div class='meta'>"
         f"  <div class='box'><b>담당 기관</b><br>{d['sourceName']}</div>"
