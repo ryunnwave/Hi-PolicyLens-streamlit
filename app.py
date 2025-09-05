@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 RegWatch – Streamlit (no paid API)
-- JSON 노출 기본 숨김(디버그 섹션에서만 표시)
-- 한국어 번역 옵션 추가 (LibreTranslate 공용/개인 엔드포인트 지원)
+- 기본 화면에서 원시 JSON 출력 제거(디버그 토글이 켜진 경우에만 표시)
+- LibreTranslate 연동 개선: /detect → /translate, 400/429 대응, 길이 제한, 회로차단
 - 차단 대응: r.jina.ai 프록시 + 텍스트 링크 추출 폴백
 """
 
-import os, re, io, json, hashlib
+import os, re, io, json, hashlib, time
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict
 from urllib.parse import urlparse, unquote
@@ -46,7 +46,7 @@ small.mono {{ font-family: ui-monospace, Menlo, Consolas, "Courier New", monospa
 """, unsafe_allow_html=True)
 
 # ----------------------- 설정 -----------------------
-USER_AGENT = "Mozilla/5.0 (compatible; RegWatch/1.2; +https://streamlit.io)"
+USER_AGENT = "Mozilla/5.0 (compatible; RegWatch/1.3; +https://streamlit.io)"
 HEADERS = {"User-Agent": USER_AGENT, "Accept-Language": "ko,en;q=0.8"}
 TIMEOUT = 25
 MAX_PER_SOURCE = 60
@@ -59,10 +59,10 @@ SOURCES = [
     {"id": "bmuv",  "name": "BMUV (독일 환경부)", "type": "rss", "url": "https://www.bundesumweltministerium.de/meldungen.rss"},
 ]
 
-# 번역 설정(옵션)
+# 번역 옵션(사이드바에서 토글)
 LT_ENDPOINT = os.environ.get("LIBRE_TRANSLATE_ENDPOINT", "https://libretranslate.com")
 LT_API_KEY  = os.environ.get("LIBRE_TRANSLATE_API_KEY", "")
-ENABLE_TRANSLATION_DEFAULT = False   # 처음엔 꺼둠(과도한 호출 방지)
+DEFAULT_TR = False  # 기본 OFF
 
 # ----------------------- 로그 -----------------------
 if "logs" not in st.session_state: st.session_state.logs=[]
@@ -84,7 +84,6 @@ def clean_text(s:str)->str: return re.sub(r"\s+"," ", (s or "")).strip()
 
 def split_sentences(text: str):
     t = clean_text(text)
-    # 고정폭 lookbehind 조합(오류 방지)
     pattern = r'(?:(?<=\.)|(?<=!)|(?<=\?)|(?<=다\.)|(?<=요\.))\s+'
     try:
         parts = re.split(pattern, t)
@@ -137,42 +136,69 @@ def normalize(source_id, source_name, title, url, date_iso, summary)->Dict:
     }
 
 def title_from_url(url: str) -> str:
-    p = urlparse(url)
-    segs = [unquote(s) for s in p.path.split("/") if s]
+    p = urlparse(url); segs = [unquote(s) for s in p.path.split("/") if s]
     if not segs: return p.netloc
-    segs = segs[-3:]
-    t = " / ".join(s.replace("-", " ").strip() for s in segs)
+    segs = segs[-3:]; t = " / ".join(s.replace("-", " ").strip() for s in segs)
     return t.title()
 
 def looks_korean(s: str) -> bool:
     return bool(re.search(r"[가-힣]", s or ""))
 
-# ----------------------- 번역(옵션) -----------------------
+# ----------------------- 번역(견고한 래퍼) -----------------------
+if "tr_fail_count" not in st.session_state: st.session_state.tr_fail_count = 0
+TR_FAIL_LIMIT = 8  # 이 이상 실패하면 해당 세션에서 번역 호출 중단(회로 차단)
+
 @st.cache_data(ttl=60*60*24, show_spinner=False)
-def libre_translate(text: str, target="ko", source="auto") -> str:
-    """LibreTranslate 사용(공용/개인 엔드포인트). 키 없으면 무키로 시도(제한/지연 가능)."""
-    if not text: return ""
+def lt_detect(text: str) -> str:
+    if not text: return "auto"
     try:
-        resp = requests.post(
-            f"{LT_ENDPOINT.rstrip('/')}/translate",
-            data={"q": text, "source": source, "target": target, "format": "text", **({"api_key": LT_API_KEY} if LT_API_KEY else {})},
-            headers={"Accept": "application/json"},
-            timeout=20,
-        )
-        if resp.status_code == 200:
-            j = resp.json()
-            return j.get("translatedText") or text
-        else:
-            log(f"번역 실패 HTTP {resp.status_code}")
-            return text
-    except Exception as ex:
-        log(f"번역 예외: {type(ex).__name__}")
+        r = requests.post(f"{LT_ENDPOINT.rstrip('/')}/detect",
+                          data={"q": text[:1000]},  # 감지만 짧게
+                          headers={"Accept":"application/json"}, timeout=15)
+        if r.status_code == 200:
+            arr = r.json()
+            if isinstance(arr, list) and arr:
+                return arr[0].get("language","auto")
+        return "auto"
+    except Exception:
+        return "auto"
+
+@st.cache_data(ttl=60*60*24, show_spinner=False)
+def lt_translate(text: str, target="ko") -> str:
+    if not text: return ""
+    # 길이 제한(과한 길이 400 오류 방지)
+    txt = text.strip()
+    if len(txt) > 1800: txt = txt[:1800]
+    src = lt_detect(txt)
+    payload = {"q": txt, "source": src, "target": target, "format":"text"}
+    if LT_API_KEY: payload["api_key"] = LT_API_KEY
+
+    # JSON 바디 우선
+    try:
+        r = requests.post(f"{LT_ENDPOINT.rstrip('/')}/translate",
+                          json=payload, headers={"Accept":"application/json"}, timeout=20)
+        if r.status_code == 200:
+            return r.json().get("translatedText") or text
+        # 폼으로 재시도
+        r2 = requests.post(f"{LT_ENDPOINT.rstrip('/')}/translate",
+                           data=payload, headers={"Accept":"application/json"}, timeout=20)
+        if r2.status_code == 200:
+            return r2.json().get("translatedText") or text
+        # 실패
+        return text
+    except Exception:
         return text
 
 def maybe_translate(text: str, enabled: bool) -> str:
-    if not enabled or looks_korean(text):  # 이미 한국어면 생략
+    if not enabled or looks_korean(text) or not text:
         return text
-    return libre_translate(text, target="ko", source="auto")
+    if st.session_state.tr_fail_count >= TR_FAIL_LIMIT:
+        return text
+    out = lt_translate(text, target="ko")
+    # 실패 heuristic: 동일 문자열이면 실패로 간주(X 그러나 실제 번역이 동일할 수도 있으므로 너무 공격적이면 안 됨)
+    if out == text:
+        st.session_state.tr_fail_count += 1
+    return out
 
 # ----------------------- HTTP + 폴백 -----------------------
 @st.cache_data(ttl=1500, show_spinner=False)
@@ -463,11 +489,11 @@ with t3:
         if st.button("캐시 초기화", use_container_width=True):
             st.cache_data.clear(); clear_logs(); st.success("HTTP 캐시를 비웠습니다.")
 
-# 번역 토글(사이드): 기본 꺼짐
 with st.sidebar:
-    enable_tr = st.checkbox("자동 한국어 번역(실험적)", value=ENABLE_TRANSLATION_DEFAULT)
-    st.markdown("<div class='warn'>공용 엔드포인트는 느리거나 제한될 수 있습니다. 안정성이 필요하면 \
-    <b>LIBRE_TRANSLATE_ENDPOINT</b>와 <b>LIBRE_TRANSLATE_API_KEY</b> 환경변수를 설정하세요.</div>", unsafe_allow_html=True)
+    enable_tr = st.checkbox("자동 한국어 번역(실험적)", value=DEFAULT_TR)
+    show_debug = st.checkbox("디버그 모드", value=False)
+    st.markdown("<div class='warn'>공용 LibreTranslate는 느리거나 제한될 수 있습니다. 안정성이 필요하면 \
+    <b>LIBRE_TRANSLATE_ENDPOINT</b> 및 <b>LIBRE_TRANSLATE_API_KEY</b>를 설정하세요.</div>", unsafe_allow_html=True)
 
 if do or "items" not in st.session_state:
     clear_logs()
@@ -475,6 +501,7 @@ if do or "items" not in st.session_state:
         st.session_state.items = fetch_all(selected or [s["id"] for s in SOURCES])
 
 items = st.session_state.get("items", [])
+
 # 기간 필터
 cut = datetime.now(timezone.utc) - timedelta(days=since_days)
 def in_range(iso):
@@ -513,7 +540,6 @@ for d in data:
     status="EFFECTIVE" if d["impact"]=="High" else ("DRAFT" if d["impact"]=="Medium" else "ANNOUNCED")
     status_class={"ANNOUNCED":"badge status-ann","DRAFT":"badge status-draft","EFFECTIVE":"badge status-eff"}[status]
 
-    # 번역(필요 시)
     title_disp   = maybe_translate(d["title"],   enable_tr)
     summary_disp = maybe_translate(d["summary"], enable_tr)
 
@@ -535,9 +561,9 @@ st.download_button("📄 Markdown 보고서 다운로드", data=md.encode("utf-8
 st.download_button("🧾 CSV 다운로드", data=df_to_csv_bytes(df),
                    file_name=f"regwatch_{datetime.now().strftime('%Y%m%d_%H%M')}.csv", mime="text/csv")
 
-# 디버그(기본 숨김) ─ JSON 노출 방지
-with st.expander("디버그: 원시 데이터 / 로그 보기"):
-    st.caption("원시 데이터와 수집 로그를 점검할 때만 펼치세요.")
-    st.json(items, expanded=False)
-    if st.session_state.logs:
-        st.markdown("<small class='mono'>"+"<br/>".join(st.session_state.logs)+"</small>", unsafe_allow_html=True)
+# 디버그(토글 OFF면 절대 표시하지 않음)
+if show_debug:
+    with st.expander("디버그: 원시 데이터 / 로그 보기", expanded=False):
+        st.json(items, expanded=False)
+        if st.session_state.logs:
+            st.markdown("<small class='mono'>"+"<br/>".join(st.session_state.logs)+"</small>", unsafe_allow_html=True)
