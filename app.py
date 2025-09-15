@@ -1,14 +1,9 @@
-# filename: pdf_compare_dragdrop_app.py
-
 import streamlit as st
 from PyPDF2 import PdfReader
 from sentence_transformers import SentenceTransformer, util
 import torch
 import re
 
-# ====================
-# PDF 텍스트 추출 함수
-# ====================
 def extract_text_from_pdf(uploaded_file):
     reader = PdfReader(uploaded_file)
     text = ""
@@ -18,17 +13,11 @@ def extract_text_from_pdf(uploaded_file):
             text += page_text + "\n"
     return text
 
-# ====================
-# 문단(청크) 분리 함수
-# ====================
 def split_into_chunks(text, min_length=30):
     raw_chunks = re.split(r"\n\s*\n", text)
     chunks = [chunk.strip() for chunk in raw_chunks if len(chunk.strip()) > min_length]
     return chunks
 
-# ====================
-# 유사도 기반 변경 문단 추출
-# ====================
 def find_changed_chunks(chunks_old, chunks_new, threshold=0.85):
     model = SentenceTransformer("all-MiniLM-L6-v2")
     emb_old = model.encode(chunks_old, convert_to_tensor=True)
@@ -45,31 +34,23 @@ def find_changed_chunks(chunks_old, chunks_new, threshold=0.85):
             })
     return changed
 
-# ====================
 # Streamlit UI
-# ====================
 st.set_page_config(page_title="📄 PDF 버전 비교기", layout="wide")
 st.title("📄 PDF 문서 버전 비교기 (드래그 앤 드롭 지원)")
 
 st.markdown("""
 드래그 앤 드롭으로 두 PDF 파일을 업로드하면,  
-**신버전에서 바뀐 문장/문단만 자동으로 추출**해줍니다.  
-- ✅ 요약 없음  
-- ✅ 원문 그대로 출력  
-- ✅ 유사도 기준 설정 가능
+**신버전에서 바뀐 문장/문단만 자동으로 추출**해줍니다.
 """)
 
-# 업로더 UI
 col1, col2 = st.columns(2)
 with col1:
     file_old = st.file_uploader("⬅️ 이전 버전 PDF 업로드", type=["pdf"], key="old")
 with col2:
     file_new = st.file_uploader("➡️ 최신 버전 PDF 업로드", type=["pdf"], key="new")
 
-# 유사도 임계값 설정
 threshold = st.slider("🔧 변경으로 판단할 최대 유사도 (낮을수록 민감)", 0.5, 0.95, 0.85, step=0.01)
 
-# 실행 버튼
 if file_old and file_new and st.button("🔍 변경된 문장 비교 시작"):
     with st.spinner("1️⃣ 텍스트 추출 중..."):
         text_old = extract_text_from_pdf(file_old)
@@ -79,7 +60,7 @@ if file_old and file_new and st.button("🔍 변경된 문장 비교 시작"):
         chunks_old = split_into_chunks(text_old)
         chunks_new = split_into_chunks(text_new)
 
-    with st.spinner("3️⃣ 유사도 계산 및 변경 문장 추출 중..."):
+    with st.spinner("3️⃣ 변경된 문장 추출 중..."):
         changed = find_changed_chunks(chunks_old, chunks_new, threshold)
 
     st.subheader("📌 변경된 문장/문단 결과")
@@ -93,5 +74,4 @@ if file_old and file_new and st.button("🔍 변경된 문장 비교 시작"):
                 </div>
             """, unsafe_allow_html=True)
     else:
-        st.success("✨ 변경된 문장이 감지되지 않았습니다. 거의 동일한 문서입니다.")
-
+        st.success("✨ 변경된 문장이 감지되지 않았습니다.")
